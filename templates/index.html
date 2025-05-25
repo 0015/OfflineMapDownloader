@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Offline Map Downloader</title>
+  <link rel="shortcut icon" href="{{ url_for('static', filename='favicon.ico') }}">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw/dist/leaflet.draw.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/nouislider@15.6.1/dist/nouislider.min.css" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+
+<body>
+  <div id="app-container">
+    <div id="map"></div>
+    <div id="overlay">
+      <h3>Offline Map Downloader</h3>
+      <label for="address">Search Address or ZIP:</label>
+      <input type="text" id="address" placeholder="Enter address or ZIP" />
+      <button id="search-btn">Go to Location</button>
+
+      <div><strong>Center:</strong> <span id="coords">-</span></div>
+      <div><strong>Zoom:</strong> <span id="zoom">-</span></div>
+      <label>Zoom Range: <span id="zoom-range-value">14 - 16</span></label>
+      <div id="zoom-slider" style="margin-bottom: 10px;"></div>
+
+      <label>Format:</label>
+      <label><input type="radio" name="format" value="zip" checked> ZIP</label>
+      <label><input type="radio" name="format" value="mbtiles"> MBTiles</label>
+      <label>Map Style:</label>
+      <select id="map-style">
+        <option value="map">Map</option>
+        <option value="satellite">Satellite</option>
+      </select>
+      <div id="prediction" style="font-size: 13px; color: #555; min-height: 20px;"></div>
+      <canvas id="tile-preview" width="280" height="180"
+        style="border-radius: 8px; margin-top: 10px; background: #f0f0f0;"></canvas>
+      <button id="download">Download Tiles</button>
+      <div id="status"></div>
+    </div>
+  </div>
+  <div id="loading-modal">
+    <div id="loading-content">
+      <div class="spinner"></div>
+      <p id="loading-status">Preparing download...</p>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet-draw/dist/leaflet.draw.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/nouislider@15.6.1/dist/nouislider.min.js"></script>
+  <script>
+    let currentMapStyle = "map";
+
+    const osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap contributors'
+    });
+
+    const satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 19,
+      attribution: 'Tiles © Esri'
+    });
+
+    const baseMaps = {
+      "Map": osmLayer,
+      "Satellite": satelliteLayer
+    };
+
+    const map = L.map('map', {
+      center: [37.7749, -122.4194],
+      zoom: 13,
+      layers: [osmLayer]
+    });
+
+    L.control.layers(baseMaps).addTo(map);
+    
+    const drawnItems = new L.FeatureGroup();
+    map.addLayer(drawnItems);
+
+    const drawControl = new L.Control.Draw({
+      draw: {
+        polygon: false,
+        polyline: false,
+        circle: false,
+        marker: false,
+        circlemarker: false,
+        rectangle: true
+      },
+      edit: { featureGroup: drawnItems }
+    });
+    map.addControl(drawControl);
+
+    let selectedBounds = null;
+    map.on('draw:created', function (e) {
+      drawnItems.clearLayers();
+      drawnItems.addLayer(e.layer);
+      selectedBounds = e.layer.getBounds();
+    });
+
+    const coordsEl = document.getElementById("coords");
+    const zoomEl = document.getElementById("zoom");
+    function updateInfo() {
+      const center = map.getCenter();
+      coordsEl.textContent = `${center.lat.toFixed(5)}, ${center.lng.toFixed(5)}`;
+      zoomEl.textContent = map.getZoom();
+    }
+    map.on("move zoom", updateInfo);
+    updateInfo();
+
+    const zoomSlider = document.getElementById("zoom-slider");
+    const zoomRangeValue = document.getElementById("zoom-range-value");
+    noUiSlider.create(zoomSlider, {
+      start: [14, 16],
+      connect: true,
+      range: { min: 10, max: 19 },
+      step: 1,
+      tooltips: true,
+      format: {
+        to: value => Math.round(value),
+        from: value => Math.round(value)
+      }
+    });
+    zoomSlider.noUiSlider.on('update', function (values) {
+      zoomRangeValue.textContent = `${values[0]} - ${values[1]}`;
+    });
+
+    async function updateTilePrediction() {
+      const predictionEl = document.getElementById("prediction");
+      if (!selectedBounds) {
+        predictionEl.textContent = "";
+        return;
+      }
+
+      const [zmin, zmax] = zoomSlider.noUiSlider.get().map(v => parseInt(v));
+      const zoomLevels = [];
+      for (let z = zmin; z <= zmax; z++) zoomLevels.push(z);
+
+      const data = {
+        bounds: {
+          north: selectedBounds.getNorth(),
+          south: selectedBounds.getSouth(),
+          east: selectedBounds.getEast(),
+          west: selectedBounds.getWest()
+        },
+        zoom_levels: zoomLevels
+      };
+
+      try {
+        const res = await fetch("/preview_tile_count", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(data)
+        });
+        const result = await res.json();
+        if (result.error) {
+          predictionEl.textContent = result.error;
+          predictionEl.style.color = "red";
+        } else {
+          predictionEl.textContent = `Estimated tile count: ${result.tile_count}`;
+          predictionEl.style.color = "#555";
+        }
+      } catch (err) {
+        predictionEl.textContent = "Prediction failed.";
+        predictionEl.style.color = "red";
+      }
+    }
+
+
+    async function updateTilePreview() {
+      const canvas = document.getElementById("tile-preview");
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      if (!selectedBounds) return;
+
+      const TILE_SIZE = 256;
+      const TILE_MARGIN = 0;
+      const zoomSlider = document.getElementById("zoom-slider");
+      const zoom = parseInt(zoomSlider.noUiSlider.get()[1]);
+
+      const [x1, y1] = deg2num(selectedBounds.getNorth(), selectedBounds.getWest(), zoom);
+      const [x2, y2] = deg2num(selectedBounds.getSouth(), selectedBounds.getEast(), zoom);
+      const x_min = Math.min(x1, x2) - TILE_MARGIN;
+      const x_max = Math.max(x1, x2) + TILE_MARGIN;
+      const y_min = Math.min(y1, y2) - TILE_MARGIN;
+      const y_max = Math.max(y1, y2) + TILE_MARGIN;
+
+      const tileCols = x_max - x_min + 1;
+      const tileRows = y_max - y_min + 1;
+
+      const previewTileWidth = tileCols * TILE_SIZE;
+      const previewTileHeight = tileRows * TILE_SIZE;
+
+      const scale = Math.min(canvas.width / previewTileWidth, canvas.height / previewTileHeight);
+      const totalWidth = previewTileWidth * scale;
+      const totalHeight = previewTileHeight * scale;
+      const offsetX = (canvas.width - totalWidth) / 2;
+      const offsetY = (canvas.height - totalHeight) / 2;
+
+      for (let x = x_min; x <= x_max; x++) {
+        for (let y = y_min; y <= y_max; y++) {
+          const img = new Image();
+          img.crossOrigin = "anonymous";
+          img.onload = () => {
+            const dx = offsetX + (x - x_min) * TILE_SIZE * scale;
+            const dy = offsetY + (y - y_min) * TILE_SIZE * scale;
+            ctx.drawImage(img, dx, dy, TILE_SIZE * scale, TILE_SIZE * scale);
+          };
+          img.src = currentMapStyle === "map"
+            ? `https://tile.openstreetmap.org/${zoom}/${x}/${y}.png`
+            : `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${zoom}/${y}/${x}`;
+        }
+      }
+    }
+
+    function deg2num(lat, lon, zoom) {
+      const latRad = lat * Math.PI / 180;
+      const n = 2 ** zoom;
+      const x = Math.floor((lon + 180) / 360 * n);
+      const y = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n);
+      return [x, y];
+    }
+
+    map.on('draw:created', () => {
+      updateTilePrediction();
+      updateTilePreview();
+    });
+
+    map.on('baselayerchange', function (e) {
+      if (e.name === "Map") {
+        currentMapStyle = "map";
+        styleSelector.value = "map";
+      } else if (e.name === "Satellite") {
+        currentMapStyle = "satellite";
+        styleSelector.value = "satellite";
+      }
+
+      updateTilePreview(); 
+    });
+
+    zoomSlider.noUiSlider.on('update', () => {
+      updateTilePrediction();
+      updateTilePreview();
+    });
+
+    const styleSelector = document.getElementById("map-style");
+
+    styleSelector.addEventListener("change", () => {
+      const style = styleSelector.value;
+      currentMapStyle = style;
+
+      if (style === "map") {
+        map.removeLayer(satelliteLayer);
+        map.addLayer(osmLayer);
+      } else {
+        map.removeLayer(osmLayer);
+        map.addLayer(satelliteLayer);
+      }
+
+      updateTilePreview();
+    });
+
+    document.getElementById("search-btn").addEventListener("click", async () => {
+      const query = document.getElementById("address").value.trim();
+      if (!query) return;
+      try {
+        const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}`);
+        const results = await res.json();
+        if (results.length > 0) {
+          const lat = parseFloat(results[0].lat);
+          const lon = parseFloat(results[0].lon);
+          map.setView([lat, lon], 15);
+        } else {
+          alert("Location not found.");
+        }
+      } catch (err) {
+        console.error("Geocoding failed:", err);
+        alert("Failed to fetch location.");
+      }
+    });
+
+    document.getElementById("download").addEventListener("click", async () => {
+      const statusEl = document.getElementById("status");
+      const [zmin, zmax] = zoomSlider.noUiSlider.get().map(v => parseInt(v));
+      const format = document.querySelector('input[name="format"]:checked').value;
+      if (!selectedBounds) {
+        statusEl.textContent = "Please draw a rectangle to select an area.";
+        statusEl.style.color = "red";
+        return;
+      }
+      const zoomLevels = [];
+
+      for (let z = zmin; z <= zmax; z++) zoomLevels.push(z);
+      const data = {
+        bounds: {
+          north: selectedBounds.getNorth(),
+          south: selectedBounds.getSouth(),
+          east: selectedBounds.getEast(),
+          west: selectedBounds.getWest()
+        },
+        zoom_levels: zoomLevels,
+        format: format,
+        map_style: currentMapStyle
+      };
+
+      try {
+        statusEl.textContent = "Calculating tile count...";
+
+        const preview = await fetch("/preview_tile_count", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(data)
+        });
+        const { tile_count, error } = await preview.json();
+        if (error) {
+          statusEl.textContent = error;
+          statusEl.style.color = "red";
+
+          return;
+        }
+        document.getElementById("loading-modal").style.display = "flex";
+        document.getElementById("loading-status").textContent = "Preparing download...";
+
+        statusEl.textContent = `Starting download of ${tile_count} tiles...`;
+        const job = await fetch("/download_tiles", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(data)
+        });
+
+        const { job_id } = await job.json();
+        const evtSource = new EventSource(`/progress/${job_id}`);
+        evtSource.onmessage = function (e) {
+          const msg = e.data;
+
+          if (msg === "error") {
+            statusEl.textContent = "An error occurred.";
+            statusEl.style.color = "red";
+            evtSource.close();
+            return;
+          }
+
+          const [done, total] = msg.split(" / ").map(Number);
+          statusEl.textContent = `Progress: ${done} / ${total}`;
+          document.getElementById("loading-status").textContent = `Downloading: ${done} / ${total}`;
+
+          if (done >= total) {
+            evtSource.close();
+            setTimeout(() => {
+              statusEl.textContent = "Download ready...";
+              document.getElementById("loading-modal").style.display = "none";
+              window.location.href = `/get_file/${job_id}`;
+            }, 500);
+          }
+
+        };
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = "Download failed.";
+        statusEl.style.color = "red";
+
+      }
+    });
+  </script>
+</body>
+
+</html>
