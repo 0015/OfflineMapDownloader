@@ -33,6 +33,8 @@ import uuid
 import threading
 import time
 import tempfile
+import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, send_file, render_template, jsonify
 
 app = Flask(__name__)
@@ -42,11 +44,74 @@ TILE_SERVERS = {
     "satellite": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
 }
 
-USER_AGENT = "OfflineTileDownloader/1.0"
+USER_AGENT = "OfflineTileDownloader/1.0 (+mailto:you@example.com)"
 MAX_TILE_COUNT = 20000
 TILE_MARGIN = 1
+REQUEST_DELAY = 0.1  # 100ms delay between requests
+MAX_WORKERS = 4  # Number of concurrent download threads
 
 download_progress = {}
+
+def download_tile_with_retry(url, headers, max_retries=3):
+    """Download a tile with exponential backoff retry logic."""
+    for attempt in range(max_retries):
+        try:
+            # Add base delay plus jitter to avoid thundering herd
+            jitter = random.uniform(0, 0.1)
+            time.sleep(REQUEST_DELAY + jitter)
+            
+            r = requests.get(url, headers=headers, timeout=10)
+            if r.status_code == 200:
+                return r.content
+            elif r.status_code == 429:  # Too Many Requests
+                wait_time = (2 ** attempt) + random.uniform(0, 1)
+                print(f"Rate limited on {url}, waiting {wait_time:.2f}s before retry {attempt + 1}")
+                time.sleep(wait_time)
+                continue
+            elif r.status_code == 404:
+                # Tile doesn't exist, no point retrying
+                print(f"Tile not found: {url}")
+                return None
+            else:
+                print(f"HTTP {r.status_code} for {url}")
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) + random.uniform(0, 1)
+                    time.sleep(wait_time)
+                continue
+        except requests.exceptions.RequestException as e:
+            if attempt == max_retries - 1:
+                print(f"Failed to download {url} after {max_retries} attempts: {e}")
+                return None
+            wait_time = (2 ** attempt) + random.uniform(0, 1)
+            print(f"Request failed for {url}, waiting {wait_time:.2f}s before retry {attempt + 1}: {e}")
+            time.sleep(wait_time)
+    
+    return None
+
+def download_single_tile(z, x, y, map_style, job_id):
+    """Download a single tile and return the tile info and data."""
+    tile_base_path = f'tiles/{map_style}'
+    tile_path = f'{tile_base_path}/{z}/{x}/{y}.png'
+    
+    # Check if tile already exists in cache
+    if os.path.exists(tile_path):
+        with open(tile_path, 'rb') as f:
+            return (z, x, y, f.read(), True)  # True indicates cached
+    
+    # Download tile
+    url_template = TILE_SERVERS.get(map_style, TILE_SERVERS["map"])
+    url = url_template.format(z=z, x=x, y=y)
+    headers = {"User-Agent": USER_AGENT}
+    
+    tile_data = download_tile_with_retry(url, headers)
+    if tile_data:
+        # Save to cache
+        os.makedirs(os.path.dirname(tile_path), exist_ok=True)
+        with open(tile_path, 'wb') as f:
+            f.write(tile_data)
+        return (z, x, y, tile_data, False)  # False indicates downloaded
+    else:
+        return (z, x, y, None, False)
 
 @app.route('/')
 def index():
@@ -96,18 +161,27 @@ def download_tiles():
                         tiles.append((z, x, y))
 
             download_progress[job_id]["total"] = len(tiles)
+            
+            print(f"Starting download of {len(tiles)} tiles for job {job_id}")
             if fmt == "mbtiles":
                 result = create_mbtiles(tiles, job_id, map_style)
             else:
                 result = create_zip(tiles, job_id, map_style)
 
-            download_progress[job_id]["done"] = True
-            download_progress[job_id]["file"] = result
-            download_progress[job_id]["format"] = fmt
-            download_progress[job_id]["style"] = map_style
+            if result:
+                download_progress[job_id]["done"] = True
+                download_progress[job_id]["file"] = result
+                download_progress[job_id]["format"] = fmt
+                download_progress[job_id]["style"] = map_style
+                print(f"Download completed for job {job_id}")
+            else:
+                download_progress[job_id]["error"] = "Failed to create file"
+                print(f"Failed to create file for job {job_id}")
 
         except Exception as e:
-            download_progress[job_id]["error"] = str(e)
+            error_msg = f"Download failed: {str(e)}"
+            download_progress[job_id]["error"] = error_msg
+            print(f"Exception in worker for job {job_id}: {error_msg}")
 
     threading.Thread(target=worker).start()
     return jsonify({"job_id": job_id})
@@ -154,29 +228,33 @@ def get_file(job_id):
 
 def create_zip(tiles, job_id, map_style):
     zip_buffer = io.BytesIO()
-    tile_base_path = f'tiles/{map_style}'
+    completed_tiles = 0
     
-    url_template = TILE_SERVERS.get(map_style, TILE_SERVERS["map"])
     with zipfile.ZipFile(zip_buffer, 'w') as zip_file:
-        for idx, (z, x, y) in enumerate(tiles):
-            download_progress[job_id]["progress"] = idx + 1
-            tile_path = f'{tile_base_path}/{z}/{x}/{y}.png'
-            if os.path.exists(tile_path):
-                with open(tile_path, 'rb') as f:
-                    zip_file.writestr(f'{z}/{x}/{y}.png', f.read())
-                continue
-
-            url = url_template.format(z=z, x=x, y=y)
-            headers = {"User-Agent": USER_AGENT}
-            try:
-                r = requests.get(url, headers=headers, timeout=10)
-                if r.status_code == 200:
-                    os.makedirs(os.path.dirname(tile_path), exist_ok=True)
-                    with open(tile_path, 'wb') as f:
-                        f.write(r.content)
-                    zip_file.writestr(f'{z}/{x}/{y}.png', r.content)
-            except Exception as e:
-                print(f"Download error {z}/{x}/{y}: {e}")
+        # Use ThreadPoolExecutor for concurrent downloads
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # Submit all download tasks
+            future_to_tile = {
+                executor.submit(download_single_tile, z, x, y, map_style, job_id): (z, x, y)
+                for z, x, y in tiles
+            }
+            
+            # Process completed downloads
+            for future in as_completed(future_to_tile):
+                z, x, y = future_to_tile[future]
+                completed_tiles += 1
+                download_progress[job_id]["progress"] = completed_tiles
+                
+                try:
+                    result_z, result_x, result_y, tile_data, was_cached = future.result()
+                    if tile_data:
+                        zip_file.writestr(f'{z}/{x}/{y}.png', tile_data)
+                        if not was_cached:
+                            print(f"Downloaded tile {z}/{x}/{y}")
+                    else:
+                        print(f"Failed to download tile {z}/{x}/{y} after retries")
+                except Exception as e:
+                    print(f"Exception downloading tile {z}/{x}/{y}: {e}")
 
     zip_buffer.seek(0)
     return io.BytesIO(zip_buffer.read())
@@ -195,37 +273,37 @@ def create_mbtiles(tiles, job_id, map_style):
     cursor.execute("INSERT INTO metadata (name, value) VALUES (?, ?)", ("type", "baselayer"))
     cursor.execute("INSERT INTO metadata (name, value) VALUES (?, ?)", ("format", "png"))
 
-    tile_base_path = f'tiles/{map_style}'
-    url_template = TILE_SERVERS.get(map_style, TILE_SERVERS["map"])
-
-    for idx, (z, x, y) in enumerate(tiles):
-        download_progress[job_id]["progress"] = idx + 1
-        tms_y = (2 ** z - 1) - y
-        tile_path = f'{tile_base_path}/{z}/{x}/{y}.png'
-
-        if os.path.exists(tile_path):
-            with open(tile_path, 'rb') as f:
-                data = f.read()
-        else:
-            url = url_template.format(z=z, x=x, y=y)
-            headers = {"User-Agent": USER_AGENT}
+    completed_tiles = 0
+    
+    # Use ThreadPoolExecutor for concurrent downloads
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all download tasks
+        future_to_tile = {
+            executor.submit(download_single_tile, z, x, y, map_style, job_id): (z, x, y)
+            for z, x, y in tiles
+        }
+        
+        # Process completed downloads
+        for future in as_completed(future_to_tile):
+            z, x, y = future_to_tile[future]
+            completed_tiles += 1
+            download_progress[job_id]["progress"] = completed_tiles
+            
             try:
-                r = requests.get(url, headers=headers, timeout=10)
-                if r.status_code == 200:
-                    data = r.content
-                    os.makedirs(os.path.dirname(tile_path), exist_ok=True)
-                    with open(tile_path, 'wb') as f:
-                        f.write(data)
+                result_z, result_x, result_y, tile_data, was_cached = future.result()
+                if tile_data:
+                    # Convert to TMS y coordinate for MBTiles format
+                    tms_y = (2 ** z - 1) - y
+                    cursor.execute(
+                        "INSERT INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)",
+                        (z, x, tms_y, sqlite3.Binary(tile_data))
+                    )
+                    if not was_cached:
+                        print(f"Downloaded tile {z}/{x}/{y}")
                 else:
-                    continue
+                    print(f"Failed to fetch {z}/{x}/{y} after retries")
             except Exception as e:
-                print(f"Failed to fetch {z}/{x}/{y}: {e}")
-                continue
-
-        cursor.execute(
-            "INSERT INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)",
-            (z, x, tms_y, sqlite3.Binary(data))
-        )
+                print(f"Exception downloading tile {z}/{x}/{y}: {e}")
 
     conn.commit()
     conn.close()
