@@ -33,6 +33,7 @@
       <select id="map-style">
         <option value="map">Map</option>
         <option value="satellite">Satellite</option>
+        <option value="bing">Bing Satellite</option>
       </select>
       <div id="prediction" style="font-size: 13px; color: #555; min-height: 20px;"></div>
       <canvas id="tile-preview" width="280" height="180"
@@ -64,9 +65,38 @@
       attribution: 'Tiles © Esri'
     });
 
+    // Bing Maps satellite layer (uses QuadKey)
+    function tileToQuadKey(x, y, z) {
+      let quadkey = "";
+      for (let i = z; i > 0; i--) {
+        let digit = 0;
+        const mask = 1 << (i - 1);
+        if ((x & mask) !== 0) digit += 1;
+        if ((y & mask) !== 0) digit += 2;
+        quadkey += digit.toString();
+      }
+      return quadkey;
+    }
+    
+    // Create custom Bing tile layer with QuadKey support
+    const BingLayer = L.TileLayer.extend({
+      getTileUrl: function(coords) {
+        const quadkey = tileToQuadKey(coords.x, coords.y, coords.z);
+        const subdomain = (coords.x + coords.y) % 4;
+        return `http://ecn.t${subdomain}.tiles.virtualearth.net/tiles/a${quadkey}.jpeg?g=1`;
+      }
+    });
+    
+    const bingLayer = new BingLayer('', {
+      maxZoom: 19,
+      attribution: '© Microsoft Bing Maps',
+      tileSize: 256
+    });
+
     const baseMaps = {
       "Map": osmLayer,
-      "Satellite": satelliteLayer
+      "Satellite": satelliteLayer,
+      "Bing Satellite": bingLayer
     };
 
     const map = L.map('map', {
@@ -209,9 +239,19 @@
             const dy = offsetY + (y - y_min) * TILE_SIZE * scale;
             ctx.drawImage(img, dx, dy, TILE_SIZE * scale, TILE_SIZE * scale);
           };
-          img.src = currentMapStyle === "map"
-            ? `https://tile.openstreetmap.org/${zoom}/${x}/${y}.png`
-            : `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${zoom}/${y}/${x}`;
+          // Generate tile URL based on current map style
+          let tileUrl = "";
+          if (currentMapStyle === "map") {
+            tileUrl = `https://tile.openstreetmap.org/${zoom}/${x}/${y}.png`;
+          } else if (currentMapStyle === "satellite") {
+            tileUrl = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${zoom}/${y}/${x}`;
+          } else if (currentMapStyle === "bing") {
+            // Bing Maps uses QuadKey encoding
+            const quadkey = tileToQuadKey(x, y, zoom);
+            const subdomain = (x + y) % 4;
+            tileUrl = `http://ecn.t${subdomain}.tiles.virtualearth.net/tiles/a${quadkey}.jpeg?g=1`;
+          }
+          img.src = tileUrl;
         }
       }
     }
@@ -229,16 +269,24 @@
       updateTilePreview();
     });
 
-    map.on('baselayerchange', function (e) {
-      if (e.name === "Map") {
-        currentMapStyle = "map";
-        styleSelector.value = "map";
-      } else if (e.name === "Satellite") {
-        currentMapStyle = "satellite";
-        styleSelector.value = "satellite";
-      }
+    const styleSelector = document.getElementById("map-style");
+    const styleToLayer = {
+      "map": osmLayer,
+      "satellite": satelliteLayer,
+      "bing": bingLayer
+    };
 
-      updateTilePreview(); 
+    map.on('baselayerchange', function (e) {
+      const layerNameToStyle = {
+        "Map": "map",
+        "Satellite": "satellite",
+        "Bing Satellite": "bing"
+      };
+      if (layerNameToStyle[e.name]) {
+        currentMapStyle = layerNameToStyle[e.name];
+        styleSelector.value = currentMapStyle;
+        updateTilePreview();
+      }
     });
 
     zoomSlider.noUiSlider.on('update', () => {
@@ -246,18 +294,20 @@
       updateTilePreview();
     });
 
-    const styleSelector = document.getElementById("map-style");
-
     styleSelector.addEventListener("change", () => {
       const style = styleSelector.value;
       currentMapStyle = style;
 
-      if (style === "map") {
-        map.removeLayer(satelliteLayer);
-        map.addLayer(osmLayer);
-      } else {
-        map.removeLayer(osmLayer);
-        map.addLayer(satelliteLayer);
+      // Remove all layers
+      Object.values(styleToLayer).forEach(layer => {
+        if (map.hasLayer(layer)) {
+          map.removeLayer(layer);
+        }
+      });
+
+      // Add selected layer
+      if (styleToLayer[style]) {
+        map.addLayer(styleToLayer[style]);
       }
 
       updateTilePreview();

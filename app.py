@@ -41,7 +41,8 @@ app = Flask(__name__)
 
 TILE_SERVERS = {
     "map": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-    "satellite": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+    "satellite": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    "bing": "http://ecn.t{s}.tiles.virtualearth.net/tiles/a{quadkey}.jpeg?g=1"
 }
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
@@ -52,7 +53,24 @@ MAX_WORKERS = 4  # Number of concurrent download threads
 
 download_progress = {}
 
-def download_tile_with_retry(url, headers, max_retries=3):
+def is_valid_image_data(data, map_style):
+    """Validate that downloaded data is a valid image."""
+    if not data or len(data) < 10:
+        return False
+    
+    # Check for JPEG format (Bing Maps uses JPEG)
+    if map_style == "bing":
+        # JPEG files start with FF D8 FF
+        if data[:3] == b'\xff\xd8\xff':
+            return True
+        return False
+    else:
+        # PNG files start with 89 50 4E 47
+        if data[:4] == b'\x89PNG':
+            return True
+        return False
+
+def download_tile_with_retry(url, headers, max_retries=3, map_style="map"):
     """Download a tile with exponential backoff retry logic."""
     for attempt in range(max_retries):
         try:
@@ -62,7 +80,16 @@ def download_tile_with_retry(url, headers, max_retries=3):
             
             r = requests.get(url, headers=headers, timeout=10)
             if r.status_code == 200:
-                return r.content
+                content = r.content
+                # Validate that the content is actually an image
+                if is_valid_image_data(content, map_style):
+                    return content
+                else:
+                    print(f"Invalid image data from {url} (size: {len(content)} bytes)")
+                    if attempt < max_retries - 1:
+                        wait_time = (2 ** attempt) + random.uniform(0, 1)
+                        time.sleep(wait_time)
+                    continue
             elif r.status_code == 429:  # Too Many Requests
                 wait_time = (2 ** attempt) + random.uniform(0, 1)
                 print(f"Rate limited on {url}, waiting {wait_time:.2f}s before retry {attempt + 1}")
@@ -100,10 +127,19 @@ def download_single_tile(z, x, y, map_style, job_id):
     
     # Download tile
     url_template = TILE_SERVERS.get(map_style, TILE_SERVERS["map"])
-    url = url_template.format(z=z, x=x, y=y)
+    
+    # Handle Bing Maps tiles (uses QuadKey encoding)
+    if map_style == "bing":
+        quadkey = tile_to_quadkey(x, y, z)
+        # Use subdomain based on tile coordinates for load balancing (0-3)
+        subdomain = (x + y) % 4
+        url = url_template.format(s=subdomain, quadkey=quadkey)
+    else:
+        url = url_template.format(z=z, x=x, y=y)
+    
     headers = {"User-Agent": USER_AGENT}
     
-    tile_data = download_tile_with_retry(url, headers)
+    tile_data = download_tile_with_retry(url, headers, map_style=map_style)
     if tile_data:
         # Save to cache
         os.makedirs(os.path.dirname(tile_path), exist_ok=True)
@@ -277,9 +313,13 @@ def create_mbtiles(tiles, job_id, map_style, bounds, zoom_levels):
     # Format bounds as "west,south,east,north" (MBTiles specification)
     bounds_str = f"{bounds['west']},{bounds['south']},{bounds['east']},{bounds['north']}"
     
+    # Determine image format based on map style
+    # Bing Maps uses JPEG, others use PNG
+    image_format = "jpg" if map_style == "bing" else "png"
+    
     # Insert required metadata for MBTiles specification
     cursor.execute("INSERT INTO metadata (name, value) VALUES (?, ?)", ("name", "Offline Map"))
-    cursor.execute("INSERT INTO metadata (name, value) VALUES (?, ?)", ("format", "png"))
+    cursor.execute("INSERT INTO metadata (name, value) VALUES (?, ?)", ("format", image_format))
     cursor.execute("INSERT INTO metadata (name, value) VALUES (?, ?)", ("version", "1.1"))
     cursor.execute("INSERT INTO metadata (name, value) VALUES (?, ?)", ("minzoom", str(minzoom)))
     cursor.execute("INSERT INTO metadata (name, value) VALUES (?, ?)", ("maxzoom", str(maxzoom)))
@@ -329,12 +369,46 @@ def create_mbtiles(tiles, job_id, map_style, bounds, zoom_levels):
     return io.BytesIO(mb_data)
 
 
+def normalize_longitude(lon):
+    """Normalize longitude to [-180, 180) range."""
+    while lon >= 180:
+        lon -= 360
+    while lon < -180:
+        lon += 360
+    return lon
+
 def deg2num(lat_deg, lon_deg, zoom):
+    """Convert latitude/longitude to tile coordinates with proper bounds checking."""
+    # Normalize longitude to valid range [-180, 180)
+    lon_deg = normalize_longitude(lon_deg)
+    
+    # Clamp latitude to valid Web Mercator range (approximately -85.05 to 85.05)
+    lat_deg = max(-85.0511287798, min(85.0511287798, lat_deg))
+    
     lat_rad = math.radians(lat_deg)
     n = 2.0 ** zoom
     x = int((lon_deg + 180.0) / 360.0 * n)
     y = int((1.0 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2.0 * n)
+    
+    # Ensure coordinates are in valid range [0, n-1] to prevent negative or out-of-range values
+    max_coord = int(n - 1)
+    x = max(0, min(max_coord, x))
+    y = max(0, min(max_coord, y))
+    
     return x, y
+
+def tile_to_quadkey(x, y, z):
+    """Convert tile coordinates (x, y, z) to Bing Maps QuadKey."""
+    quadkey = ""
+    for i in range(z, 0, -1):
+        digit = 0
+        mask = 1 << (i - 1)
+        if (x & mask) != 0:
+            digit += 1
+        if (y & mask) != 0:
+            digit += 2
+        quadkey += str(digit)
+    return quadkey
 
 def num2deg(x, y, zoom):
     """Convert tile coordinates to latitude/longitude (inverse of deg2num)."""
