@@ -58,14 +58,14 @@ def is_valid_image_data(data, map_style):
     if not data or len(data) < 10:
         return False
     
-    # Check for JPEG format (Bing Maps uses JPEG)
-    if map_style == "bing":
+    # Check for JPEG format (Bing Maps and ArcGIS Satellite use JPEG)
+    if map_style == "bing" or map_style == "satellite":
         # JPEG files start with FF D8 FF
         if data[:3] == b'\xff\xd8\xff':
             return True
         return False
     else:
-        # PNG files start with 89 50 4E 47
+        # PNG files start with 89 50 4E 47 (OSM uses PNG)
         if data[:4] == b'\x89PNG':
             return True
         return False
@@ -314,8 +314,8 @@ def create_mbtiles(tiles, job_id, map_style, bounds, zoom_levels):
     bounds_str = f"{bounds['west']},{bounds['south']},{bounds['east']},{bounds['north']}"
     
     # Determine image format based on map style
-    # Bing Maps uses JPEG, others use PNG
-    image_format = "jpg" if map_style == "bing" else "png"
+    # Bing Maps and ArcGIS Satellite use JPEG, OSM uses PNG
+    image_format = "jpg" if map_style in ("bing", "satellite") else "png"
     
     # Insert required metadata for MBTiles specification
     cursor.execute("INSERT INTO metadata (name, value) VALUES (?, ?)", ("name", "Offline Map"))
