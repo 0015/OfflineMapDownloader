@@ -1,0 +1,7 @@
+tiles/
+.venv/
+__pycache__/
+*.pyc
+.code/
+.cursor/
+.idea/

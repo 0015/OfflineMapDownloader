@@ -44,7 +44,7 @@ TILE_SERVERS = {
     "satellite": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
 }
 
-USER_AGENT = "OfflineTileDownloader/1.0 (+mailto:you@example.com)"
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
 MAX_TILE_COUNT = 20000
 TILE_MARGIN = 1
 REQUEST_DELAY = 0.1  # 100ms delay between requests
@@ -164,7 +164,7 @@ def download_tiles():
             
             print(f"Starting download of {len(tiles)} tiles for job {job_id}")
             if fmt == "mbtiles":
-                result = create_mbtiles(tiles, job_id, map_style)
+                result = create_mbtiles(tiles, job_id, map_style, bounds, zoom_levels)
             else:
                 result = create_zip(tiles, job_id, map_style)
 
@@ -259,7 +259,7 @@ def create_zip(tiles, job_id, map_style):
     zip_buffer.seek(0)
     return io.BytesIO(zip_buffer.read())
 
-def create_mbtiles(tiles, job_id, map_style):
+def create_mbtiles(tiles, job_id, map_style, bounds, zoom_levels):
     tmpfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mbtiles")
     conn = sqlite3.connect(tmpfile.name)
     cursor = conn.cursor()
@@ -269,9 +269,22 @@ def create_mbtiles(tiles, job_id, map_style):
         CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB);
         CREATE UNIQUE INDEX tile_index ON tiles (zoom_level, tile_column, tile_row);
     """)
+    
+    # Calculate zoom range
+    minzoom = min(zoom_levels)
+    maxzoom = max(zoom_levels)
+    
+    # Format bounds as "west,south,east,north" (MBTiles specification)
+    bounds_str = f"{bounds['west']},{bounds['south']},{bounds['east']},{bounds['north']}"
+    
+    # Insert required metadata for MBTiles specification
     cursor.execute("INSERT INTO metadata (name, value) VALUES (?, ?)", ("name", "Offline Map"))
-    cursor.execute("INSERT INTO metadata (name, value) VALUES (?, ?)", ("type", "baselayer"))
     cursor.execute("INSERT INTO metadata (name, value) VALUES (?, ?)", ("format", "png"))
+    cursor.execute("INSERT INTO metadata (name, value) VALUES (?, ?)", ("version", "1.1"))
+    cursor.execute("INSERT INTO metadata (name, value) VALUES (?, ?)", ("minzoom", str(minzoom)))
+    cursor.execute("INSERT INTO metadata (name, value) VALUES (?, ?)", ("maxzoom", str(maxzoom)))
+    cursor.execute("INSERT INTO metadata (name, value) VALUES (?, ?)", ("bounds", bounds_str))
+    cursor.execute("INSERT INTO metadata (name, value) VALUES (?, ?)", ("type", "baselayer"))
 
     completed_tiles = 0
     
@@ -322,6 +335,14 @@ def deg2num(lat_deg, lon_deg, zoom):
     x = int((lon_deg + 180.0) / 360.0 * n)
     y = int((1.0 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2.0 * n)
     return x, y
+
+def num2deg(x, y, zoom):
+    """Convert tile coordinates to latitude/longitude (inverse of deg2num)."""
+    n = 2.0 ** zoom
+    lon_deg = x / n * 360.0 - 180.0
+    lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * y / n)))
+    lat_deg = math.degrees(lat_rad)
+    return lat_deg, lon_deg
 
 if __name__ == '__main__':
     app.run(debug=True)
