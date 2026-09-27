@@ -1,0 +1,875 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Offline Navigation Packager</title>
+  <link rel="shortcut icon" href="{{ url_for('static', filename='favicon.ico') }}">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <link rel="stylesheet" href="/static/style.css" />
+  <style>
+    /* Only what the v1 stylesheet does not already cover. */
+    #app-container { position: relative; }
+    #overlay h2 { margin: 0 0 4px; font-size: 16px; }
+    .hint { color: #9aa6b2; font-size: 12px; line-height: 1.5; margin: 0; }
+    .row { display: flex; gap: 8px; align-items: center; }
+    .row > * { flex: 1; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chips label {
+      flex: 0 0 auto; background: #2b2b2b; border: 1px solid #555;
+      border-radius: 6px; padding: 5px 9px; cursor: pointer; font-size: 13px;
+    }
+    .chips label.on { background: #0e639c; border-color: #1f8ad2; }
+    .chips input { display: none; }
+    button {
+      padding: 10px; border-radius: 6px; border: none; cursor: pointer;
+      background: #007acc; color: #fff; font-size: 14px;
+    }
+    /* style.css makes every #overlay button blue, and its id outranks a bare
+       class, so these are scoped the same way or they never show: Clear and
+       Estimate came out blue, and a disabled Build looked ready to press. */
+    #overlay button.secondary { background-color: #3a3a3a; }
+    #overlay button.secondary:hover { background-color: #4a4a4a; }
+    #overlay button:disabled,
+    #overlay button:disabled:hover {
+      background-color: #3a3a3a; color: #777; cursor: not-allowed; transform: none;
+    }
+
+    /* The mode switch shows and hides these, and they are wrappers and nothing
+       more: their children lay out as the column's own, spaced by its gap. */
+    #route-step, #area-step, #corridor-row { display: contents; }
+    .stats { background: #2b2b2b; border-radius: 6px; padding: 10px; font-size: 13px; }
+    .stats div { display: flex; justify-content: space-between; padding: 2px 0; }
+    .stats b { color: #6fc3ff; font-weight: 600; }
+    .warn { color: #ffb86b; }
+    .err { color: #ff7b6b; }
+    hr { border: none; border-top: 1px solid #333; margin: 4px 0; }
+
+    /* Long explanations are useful once and noise afterwards, so they fold
+       away behind a question mark instead of pushing the controls off screen. */
+    details.help { margin: -4px 0 2px; }
+    details.help > summary {
+      list-style: none; cursor: pointer; color: #6b7681; font-size: 12px;
+      display: inline-block; padding: 1px 7px; border: 1px solid #3a444e;
+      border-radius: 10px;
+    }
+    details.help > summary::-webkit-details-marker { display: none; }
+    details.help > summary:hover { color: #9aa6b2; border-color: #55626e; }
+    details.help p { margin: 6px 0 0; color: #9aa6b2; font-size: 12px; line-height: 1.5; }
+
+    .step { color: #6fc3ff; font-size: 11px; letter-spacing: .09em;
+            text-transform: uppercase; margin: 6px 0 -2px; }
+
+    /* The route result lives over the map, next to the line it describes,
+       rather than buried halfway down a column of controls. */
+    #route-card {
+      position: absolute; left: 16px; bottom: 16px; width: 384px; z-index: 800;
+      background: rgba(17, 22, 28, .93); color: #f2f5f8;
+      border: 1px solid #2c353f; border-radius: 12px;
+      box-shadow: 0 10px 28px rgba(0, 0, 0, .55);
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      display: none;
+    }
+    #route-card.on { display: block; }
+    .rc-head {
+      display: flex; align-items: center; gap: 10px;
+      padding: 12px 14px 10px; border-bottom: 1px solid #222b34;
+    }
+    .rc-title { font-size: 15px; font-weight: 600; flex: 1;
+                white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .rc-badge { font-size: 11px; padding: 3px 9px; border-radius: 10px;
+                background: #1d2b3d; color: #6fc3ff; white-space: nowrap; }
+    .rc-badge.loop { background: #14331f; color: #58d08a; }
+    .rc-stats { display: flex; padding: 12px 6px 14px; }
+    .rc-stat { flex: 1; text-align: center; }
+    .rc-val { font-size: 21px; font-weight: 600; line-height: 1.1; }
+    .rc-cap { font-size: 10px; color: #7d8894; letter-spacing: .06em;
+              text-transform: uppercase; margin-top: 3px; }
+    .rc-note { padding: 0 14px 10px; margin-top: -4px;
+               font-size: 12px; line-height: 1.45; color: #9aa6b2; }
+    .rc-note.warn { color: #ffb86b; }
+    #rc-turns { border-top: 1px solid #222b34; }
+    #rc-turns > summary {
+      list-style: none; cursor: pointer; padding: 9px 14px;
+      font-size: 12px; color: #9aa6b2;
+    }
+    #rc-turns > summary::-webkit-details-marker { display: none; }
+    #rc-turns > summary:hover { color: #6fc3ff; }
+    #rc-turns ol { margin: 0; padding: 0 14px 12px 32px;
+                   max-height: 190px; overflow-y: auto;
+                   font-size: 12px; color: #c8d0d8; }
+    #rc-turns li { margin-bottom: 4px; cursor: pointer; }
+    #rc-turns li:hover { color: #6fc3ff; }
+  </style>
+</head>
+<body>
+<div id="app-container">
+  <div id="map"></div>
+
+  <!-- The planned route reports itself over the map, beside the line it
+       describes, instead of competing with the controls for column space. -->
+  <div id="route-card">
+    <div class="rc-head">
+      <div class="rc-title" id="rc-name">Route</div>
+      <span class="rc-badge" id="rc-kind"></span>
+    </div>
+    <div class="rc-stats">
+      <div class="rc-stat"><div class="rc-val" id="rc-dist">-</div><div class="rc-cap" id="rc-dist-cap">km</div></div>
+      <div class="rc-stat"><div class="rc-val" id="rc-time">-</div><div class="rc-cap">min</div></div>
+      <div class="rc-stat"><div class="rc-val" id="rc-turns-n">-</div><div class="rc-cap">turns</div></div>
+      <div class="rc-stat"><div class="rc-val" id="rc-points">-</div><div class="rc-cap">points</div></div>
+    </div>
+    <div class="rc-note" id="rc-how"></div>
+    <div class="rc-note warn" id="rc-warn"></div>
+    <details id="rc-turns">
+      <summary>Turn by turn</summary>
+      <ol id="rc-list"></ol>
+    </details>
+  </div>
+
+  <div id="overlay">
+    <h2>Offline Navigation Packager</h2>
+
+    <!-- A route and the corridor round it, or a rectangle of map with no route
+         at all. Steps 2 and 3 are the same for both. -->
+    <div class="chips" id="mode">
+      <label class="on"><input type="radio" name="mode" value="route" checked />Route</label>
+      <label><input type="radio" name="mode" value="area" />Area &middot; tiles only</label>
+    </div>
+
+    <div id="route-step">
+    <div class="step">1 &middot; Route</div>
+
+    <div class="row">
+      <select id="kind">
+        <option value="drive">Drive</option>
+        <option value="exercise">Exercise</option>
+      </select>
+      <select id="profile">
+        <option value="driving">Driving</option>
+        <option value="cycling">Cycling</option>
+        <option value="walking">Walking</option>
+      </select>
+    </div>
+
+    <!-- Driving: what to stay off. Walking and cycling: how much distance to
+         trade for paths. Only the set that applies to the profile shows. -->
+    <div class="chips" id="avoid">
+      <label><input type="checkbox" value="tolls" />Avoid tolls</label>
+      <label><input type="checkbox" value="highways" />Avoid highways</label>
+    </div>
+    <div class="chips" id="style">
+      <label class="on"><input type="radio" name="style" value="balanced" checked />Balanced</label>
+      <label><input type="radio" name="style" value="trails" />Prefer trails</label>
+      <label><input type="radio" name="style" value="shortest" />Shortest</label>
+    </div>
+    <p class="hint" id="profile-note"></p>
+
+    <label style="display:flex;gap:8px;align-items:center;cursor:pointer">
+      <input type="checkbox" id="close-loop" style="width:auto" />
+      Return to the start (closed loop)
+    </label>
+
+    <input type="text" id="route-name" placeholder="Route name (shown on the device)" />
+
+    <div class="row">
+      <button id="plan">Plan route</button>
+      <button id="clear" class="secondary">Clear</button>
+    </div>
+
+    <details class="help"><summary>?</summary>
+      <p>
+        Click the map to drop waypoints. Every one is a via point, so the route
+        goes the way you drew it rather than the way the router would have
+        preferred. Tick the loop box and it comes back to the start, and the
+        device laps it instead of arriving.
+      </p>
+      <p>
+        Avoid tolls / highways keeps the route off them wherever there is a
+        reasonable way round, and says so on the route card when there is not.
+        Toggle one after planning and the route is planned again, so you can
+        compare the two.
+      </p>
+      <p>
+        Walking and cycling routes use footpaths, park paths, steps, trails and
+        cycleways that a car route never touches. <b>Balanced</b> is the
+        router's own judgement. <b>Prefer trails</b> leans onto paths and
+        trails even where that is a little longer; for cycling it plans for a
+        mountain bike. <b>Shortest</b> takes every cut-through the mode is
+        allowed, whatever the climb or surface. The last two also allow hiking
+        trails up to mountain hiking (T2) on foot. Switching style after
+        planning plans again, like the avoid switches.
+      </p>
+    </details>
+    </div>
+
+    <div id="area-step" style="display:none">
+      <div class="step">1 &middot; Area</div>
+      <p class="hint" id="area-note">Click two opposite corners on the map.</p>
+      <input type="text" id="area-name" placeholder="Area name (for the build note)" />
+      <div class="row">
+        <button id="area-view">Use this view</button>
+        <button id="area-clear" class="secondary">Clear</button>
+      </div>
+      <details class="help"><summary>?</summary>
+        <p>
+          For a map to look at, with no route and nothing to follow. Every tile
+          the rectangle touches is downloaded at each zoom you pick, so keep it
+          to the ground you need: the count grows with the area, and four times
+          over for every zoom level you add.
+        </p>
+        <p>
+          Drag a corner to adjust it; a third click starts a new rectangle. The
+          device lists the tile folder beside the routes as a map of its own,
+          and a card with nothing else on it opens straight into the map.
+        </p>
+      </details>
+    </div>
+
+    <hr />
+    <div class="step">2 &middot; Tiles</div>
+
+    <label>Zoom levels</label>
+    <div class="chips" id="zooms"></div>
+
+    <div id="corridor-row">
+      <label>Corridor width: <span id="corridor-label">300 m</span></label>
+      <input type="range" id="corridor" min="100" max="1500" step="50" value="300" />
+    </div>
+
+    <details class="help"><summary>?</summary>
+      <p>
+        z16&ndash;17 is the sweet spot for driving; every extra level roughly
+        doubles or triples a route's tile count. The corridor is how far either
+        side of the route to keep tiles &mdash; wider means you can pan around,
+        or stray off route, without hitting blank map.
+      </p>
+    </details>
+
+    <label>Tile source</label>
+    <select id="source"></select>
+    <p class="hint" id="source-note"></p>
+
+    <div id="key-row" style="display:none">
+      <label id="key-label">API key</label>
+      <div class="row">
+        <input type="password" id="key-input" placeholder="paste the key" />
+        <button id="key-save" style="flex:0 0 74px">Save</button>
+      </div>
+      <p class="hint" id="key-state"></p>
+    </div>
+
+    <details class="help" id="settings">
+      <summary>Settings</summary>
+      <label>Contact email</label>
+      <input type="text" id="set-contact" placeholder="you@example.com" />
+      <p>
+        Goes in the User-Agent the tile servers see. Not enforced by anything
+        here, but it is what their policies ask for and what lets a provider
+        reach you instead of just blocking you.
+      </p>
+      <label>Driving router (OSRM)</label>
+      <input type="text" id="set-osrm" placeholder="https://router.project-osrm.org" />
+      <label>Valhalla router</label>
+      <input type="text" id="set-valhalla" placeholder="https://valhalla1.openstreetmap.de" />
+      <p>
+        Walking, cycling, and driving that avoids tolls or highways are planned
+        by Valhalla: the OSRM demo only knows the car, and cannot leave roads
+        out.
+      </p>
+      <div class="row" style="margin-top:8px">
+        <button id="set-save">Save settings</button>
+      </div>
+      <p id="set-where"></p>
+    </details>
+
+    <label>Tile folder on the card</label>
+    <input type="text" id="folder" value="tiles1" placeholder="tiles1" />
+
+    <details class="help"><summary>?</summary>
+      <p>
+        Routes covering the same ground should use the same folder and will
+        share its tiles, and so can an area. Give a route in another region its
+        own, e.g. <code>tiles_tahoe</code>. Unzip several builds onto one card
+        and the device lists them all.
+      </p>
+    </details>
+
+    <hr />
+    <div class="step">3 &middot; Build</div>
+
+    <div class="row">
+      <button id="estimate" class="secondary">Estimate</button>
+      <button id="build" disabled>Build SD package</button>
+    </div>
+
+    <div id="estimate-out" class="stats" style="display:none"></div>
+    <div id="status" class="hint"></div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<script>
+// Where the map opens before you have planned anything. Downtown Los Angeles.
+const HOME = [34.0522, -118.2437];
+const HOME_ZOOM = 13;
+
+const map = L.map('map').setView(HOME, HOME_ZOOM);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
+}).addTo(map);
+
+/* Each mode draws into its own layer, so switching hides the other's work
+   without losing it. */
+const routeLayer = L.layerGroup().addTo(map);
+const areaLayer = L.layerGroup();
+
+let waypoints = [];
+let markers = [];
+let routeLine = null;
+let corridorLine = null;
+let stepMarkers = [];
+let routeId = null;
+
+const $ = (id) => document.getElementById(id);
+
+const isArea = () => $('mode').querySelector('input:checked').value === 'area';
+
+/* ------------------------------------------------------------- waypoints */
+
+function redrawMarkers() {
+  markers.forEach(m => routeLayer.removeLayer(m));
+  markers = waypoints.map((wp, i) => {
+    const label = i === 0 ? 'A' : (i === waypoints.length - 1 ? 'B' : String(i));
+    const m = L.marker(wp, { draggable: true }).addTo(routeLayer).bindTooltip(label, {
+      permanent: true, direction: 'top', className: 'wp-label'
+    });
+    m.on('dragend', (e) => { waypoints[i] = [e.target.getLatLng().lat, e.target.getLatLng().lng]; });
+    return m;
+  });
+}
+
+map.on('click', (e) => {
+  if (isArea()) { addCorner(e.latlng); return; }
+  waypoints.push([e.latlng.lat, e.latlng.lng]);
+  redrawMarkers();
+});
+
+$('clear').onclick = () => {
+  waypoints = [];
+  routeId = null;
+  redrawMarkers();
+  [routeLine, corridorLine].forEach(l => l && routeLayer.removeLayer(l));
+  routeLine = corridorLine = null;
+  stepMarkers.forEach(m => routeLayer.removeLayer(m));
+  stepMarkers = [];
+  $('route-card').classList.remove('on');
+  $('estimate-out').style.display = 'none';
+  $('build').disabled = true;
+  setStatus('');
+};
+
+/* ------------------------------------------------------------------ area */
+
+let corners = [];           // two opposite corners once the area is drawn
+let areaRect = null;
+
+const areaBounds = () => corners.length === 2 ? L.latLngBounds(corners) : null;
+
+function reshapeArea() {
+  const b = areaBounds();
+  if (!b) return;
+  if (areaRect) areaRect.setBounds(b);
+  else areaRect = L.rectangle(b, {
+    color: '#2F7BEF', weight: 2, fillOpacity: 0.08, interactive: false
+  }).addTo(areaLayer);
+}
+
+/* The size, so the rectangle can be judged before anything is counted. */
+function describeArea() {
+  const b = areaBounds();
+  if (!b) {
+    $('area-note').textContent = corners.length
+      ? 'Now click the opposite corner.' : 'Click two opposite corners on the map.';
+    return;
+  }
+  const mid = b.getCenter().lat;
+  const w = map.distance([mid, b.getWest()], [mid, b.getEast()]) / 1000;
+  const h = map.distance([b.getSouth(), b.getWest()], [b.getNorth(), b.getWest()]) / 1000;
+  $('area-note').textContent =
+    `${w.toFixed(1)} × ${h.toFixed(1)} km. Drag a corner to adjust it.`;
+}
+
+function areaChanged() {
+  describeArea();
+  $('estimate-out').style.display = 'none';   // counted for the old area
+  syncBuildButton();
+}
+
+function drawArea() {
+  areaLayer.clearLayers();
+  areaRect = null;
+  corners.forEach((c, i) => {
+    const m = L.marker(c, { draggable: true }).addTo(areaLayer);
+    m.on('drag', (e) => { corners[i] = e.target.getLatLng().wrap(); reshapeArea(); });
+    m.on('dragend', areaChanged);
+  });
+  reshapeArea();
+  areaChanged();
+}
+
+function addCorner(latlng) {
+  if (corners.length === 2) corners = [];     // a third click starts over
+  corners.push(latlng.wrap());
+  drawArea();
+}
+
+$('area-view').onclick = () => {
+  const b = map.getBounds().pad(-0.08);       // inset, so the corners can be grabbed
+  corners = [b.getSouthWest().wrap(), b.getNorthEast().wrap()];
+  drawArea();
+};
+$('area-clear').onclick = () => { corners = []; drawArea(); setStatus(''); };
+
+/* ------------------------------------------------------------------ mode */
+
+function syncBuildButton() {
+  $('build').disabled = isArea() ? !areaBounds() : !routeId;
+}
+
+function applyMode() {
+  const area = isArea();
+  $('mode').querySelectorAll('label').forEach(l =>
+    l.classList.toggle('on', l.querySelector('input').checked));
+  $('route-step').style.display = area ? 'none' : '';
+  $('area-step').style.display = area ? '' : 'none';
+  $('corridor-row').style.display = area ? 'none' : '';
+  $('route-card').classList.toggle('on', !area && routeId !== null);
+  if (area) { map.removeLayer(routeLayer); areaLayer.addTo(map); }
+  else      { map.removeLayer(areaLayer); routeLayer.addTo(map); }
+  $('estimate-out').style.display = 'none';
+  describeArea();
+  syncBuildButton();
+  setStatus('');
+}
+$('mode').querySelectorAll('input').forEach(i => { i.onchange = applyMode; });
+
+/* What a build is of: the planned route, or the area on its own. */
+function target() {
+  if (isArea()) {
+    const b = areaBounds();
+    return b && {
+      area: { south: b.getSouth(), west: b.getWest(), north: b.getNorth(), east: b.getEast() },
+      name: $('area-name').value,
+    };
+  }
+  return routeId && { route_id: routeId };
+}
+
+/* ------------------------------------------------------------------ zooms */
+
+const ZOOM_RANGE = [12, 13, 14, 15, 16, 17, 18, 19];
+const DEFAULT_ZOOMS = [15, 16, 17];
+ZOOM_RANGE.forEach(z => {
+  const on = DEFAULT_ZOOMS.includes(z);
+  const el = document.createElement('label');
+  el.className = on ? 'on' : '';
+  el.innerHTML = `<input type="checkbox" value="${z}" ${on ? 'checked' : ''}/>z${z}`;
+  el.querySelector('input').onchange = (e) => el.classList.toggle('on', e.target.checked);
+  $('zooms').appendChild(el);
+});
+const selectedZooms = () =>
+  [...$('zooms').querySelectorAll('input:checked')].map(i => parseInt(i.value, 10));
+
+$('corridor').oninput = (e) => { $('corridor-label').textContent = e.target.value + ' m'; };
+
+/* ---------------------------------------------------------- tile sources */
+
+let sources = {};
+
+const esc = (t) => t.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+
+function describeSource() {
+  const s = sources[$('source').value];
+  if (!s) { $('source-note').textContent = ''; $('key-row').style.display = 'none'; return; }
+
+  let note, warn = false;
+  if (!s.bulk_ok) {
+    note = '<b>Cannot build a card with this.</b> ' + (s.policy || '');
+    warn = true;
+  } else if (!s.available) {
+    /* Set but still unusable - a path that is not there, a vector .mbtiles -
+       says why; unset just points at the field. */
+    const f = settingsFields[s.setting];
+    note = f && f.set ? esc(s.reason) : 'Not set up yet &mdash; fill in the field below.';
+    warn = true;
+  } else {
+    note = (s.policy ? s.policy + '<br>' : '') + s.attribution;
+    if (s.bulk_limit_bytes) warn = true;
+  }
+  $('source-note').innerHTML = note + ` &middot; up to z${s.max_zoom}`;
+  $('source-note').className = 'hint' + (warn ? ' warn' : '');
+
+  /* The field this source needs sits right under it, and stays there once it
+     is set, so a wrong key or a moved file can be put right in the same place. */
+  const field = s.bulk_ok ? s.setting : null;
+  if (field && settingsFields[field]) {
+    const f = settingsFields[field];
+    $('key-row').style.display = 'block';
+    $('key-label').textContent = f.label;
+    $('key-input').type = f.secret ? 'password' : 'text';
+    $('key-input').placeholder = f.secret ? 'paste the key' : '';
+    /* A key never comes back, only its mask; a URL or a path can be edited. */
+    $('key-input').value = !f.secret && f.source === 'saved' ? f.masked : '';
+    $('key-input').dataset.field = field;
+    $('key-state').textContent = !f.set ? 'not set'
+      : `currently ${f.masked} (${f.source})`
+        + (f.source === 'saved' ? ' · save it empty to remove it' : '');
+    $('key-state').className = 'hint' + (f.set ? '' : ' warn');
+  } else {
+    $('key-row').style.display = 'none';
+  }
+}
+
+let settingsFields = {};
+
+/* Settings and the source list move together: saving a key changes which
+   sources are usable, so both are refreshed from the same reply. */
+async function applySettings(d) {
+  settingsFields = d.fields;
+  sources = {};
+  const sel = $('source'), was = sel.value;
+  sel.innerHTML = '';
+  d.sources.forEach(s => {
+    sources[s.id] = s;
+    const o = document.createElement('option');
+    o.value = s.id;
+    const f = settingsFields[s.setting];
+    o.textContent = s.label
+      + (!s.bulk_ok ? '  (not for offline use)'
+         : s.available ? ''
+         : f && f.secret ? '  (needs a key)' : '  (not set up)');
+    o.disabled = !s.bulk_ok;
+    sel.appendChild(o);
+  });
+  sel.value = (was && sources[was] && sources[was].bulk_ok) ? was : d.default_source;
+
+  $('set-contact').value = d.fields.TILE_CONTACT.source === 'saved'
+    ? d.fields.TILE_CONTACT.masked : '';
+  $('set-contact').placeholder = d.fields.TILE_CONTACT.set
+    ? d.fields.TILE_CONTACT.masked + '  (' + d.fields.TILE_CONTACT.source + ')'
+    : 'you@example.com';
+  $('set-osrm').value = d.fields.OSRM_BASE_URL.source === 'saved'
+    ? d.fields.OSRM_BASE_URL.masked : '';
+  $('set-osrm').placeholder = d.routing.base_url;
+  $('set-valhalla').value = d.fields.VALHALLA_BASE_URL.source === 'saved'
+    ? d.fields.VALHALLA_BASE_URL.masked : '';
+  $('set-valhalla').placeholder = d.routing.valhalla_base_url;
+  $('set-where').textContent = 'Saved in ' + d.path + ' (owner-readable only). '
+    + 'Leave a field empty to fall back to the environment.';
+
+  describeSource();
+  describeRouting(d.routing);
+}
+
+async function saveSettings(values) {
+  const r = await fetch('/api/settings', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(values)
+  });
+  const d = await r.json();
+  if (!r.ok) { setStatus(d.error || 'Could not save.', 'err'); return false; }
+  await applySettings(d);
+  return true;
+}
+
+/* Saving a field empty removes what was saved, and the environment takes over
+   again - which is also the only way back to it. */
+$('key-save').onclick = async () => {
+  const field = $('key-input').dataset.field;
+  if (!field) return;
+  const f = settingsFields[field];
+  const value = $('key-input').value.trim();
+  if (!value && f.source !== 'saved') {
+    setStatus(f.secret ? 'Paste the key first.' : 'Fill it in first.', 'warn');
+    return;
+  }
+  if (await saveSettings({ [field]: value })) {
+    setStatus(f.label + (value ? ' saved.' : ' removed.'));
+  }
+};
+
+$('set-save').onclick = async () => {
+  const v = {
+    TILE_CONTACT:      $('set-contact').value.trim(),
+    OSRM_BASE_URL:     $('set-osrm').value.trim(),
+    VALHALLA_BASE_URL: $('set-valhalla').value.trim(),
+  };
+  if (await saveSettings(v)) setStatus('Settings saved.');
+};
+
+/* -------------------------------------------------------- profile options */
+
+let osrmHost = '', valhallaHost = '';
+
+/* Tolls and highways are a driving question, and how much distance to trade
+   for paths a walking and cycling one, so each set of chips only shows for
+   the profiles it applies to. */
+const isDriving = () => $('profile').value === 'driving';
+const selectedAvoid = () => !isDriving() ? [] :
+  [...$('avoid').querySelectorAll('input:checked')].map(i => i.value);
+const selectedStyle = () => isDriving() ? 'balanced' :
+  $('style').querySelector('input:checked').value;
+
+const PROFILE_NAMES = { driving: 'Driving', cycling: 'Cycling', walking: 'Walking' };
+const STYLE_NAMES = { balanced: 'balanced', trails: 'prefer trails', shortest: 'shortest' };
+
+/* What the chosen style does, said under the chips. */
+const STYLE_NOTES = {
+  walking: {
+    balanced: 'Footpaths, park paths and steps as well as streets, weighed against hills.',
+    trails:   'Leans onto footpaths, tracks and hiking trails, away from streets.',
+    shortest: 'The shortest way on foot: every cut-through, whatever the climb.',
+  },
+  cycling: {
+    balanced: 'Cycleways and bike trails as well as roads, for a hybrid bike.',
+    trails:   'For a mountain bike: dirt is rideable, roads with traffic are avoided.',
+    shortest: 'The shortest way a bike may go: every cut-through, whatever the surface.',
+  },
+};
+
+const at = (host) => host ? ' at ' + host : '';
+
+function describeProfile() {
+  const driving = isDriving();
+  $('avoid').style.display = driving ? 'flex' : 'none';
+  $('style').style.display = driving ? 'none' : 'flex';
+
+  $('profile-note').textContent = !driving
+    ? STYLE_NOTES[$('profile').value][selectedStyle()]
+      + ' Planned by Valhalla' + at(valhallaHost) + '.'
+    : selectedAvoid().length
+      ? 'Planned by Valhalla' + at(valhallaHost) + '.'
+      : 'Planned by OSRM' + at(osrmHost) + '.';
+}
+
+/* The point of a switch is the difference it makes, so once a route is on the
+   map, flipping one plans it again straight away. */
+function planAgain() { if (routeId) planRoute(); }
+
+$('avoid').querySelectorAll('label').forEach(el => {
+  el.querySelector('input').onchange = (e) => {
+    el.classList.toggle('on', e.target.checked);
+    describeProfile();
+    planAgain();
+  };
+});
+$('style').querySelectorAll('label').forEach(el => {
+  el.querySelector('input').onchange = () => {
+    $('style').querySelectorAll('label').forEach(l =>
+      l.classList.toggle('on', l.querySelector('input').checked));
+    describeProfile();
+    planAgain();
+  };
+});
+$('profile').onchange = () => { describeProfile(); planAgain(); };
+describeProfile();
+
+function describeRouting(r) {
+  osrmHost = r.base_url;
+  valhallaHost = r.valhalla_base_url;
+  describeProfile();
+}
+
+async function loadSources() {
+  await applySettings(await (await fetch('/api/settings')).json());
+}
+
+/* The source dropdown needs the settings to know which keys are present, so
+   one call fills both. */
+$('source').onchange = describeSource;
+loadSources();
+
+function setStatus(text, cls) {
+  $('status').className = 'hint ' + (cls || '');
+  $('status').textContent = text;
+}
+
+const fmtKm = (m) => (m / 1000).toFixed(2) + ' km';
+
+/* ------------------------------------------------------------- route card */
+
+function showRouteCard(data) {
+  const name = $('route-name').value.trim() || (data.loop ? 'Circuit' : 'Route');
+  $('rc-name').textContent = name;
+  $('rc-name').title = name;
+
+  const badge = $('rc-kind');
+  badge.textContent = data.kind + (data.loop ? ' \u00b7 loop' : '');
+  badge.className = 'rc-badge' + (data.loop ? ' loop' : '');
+
+  $('rc-dist').textContent = (data.distance_m / 1000).toFixed(1);
+  $('rc-dist-cap').textContent = data.loop ? 'km / lap' : 'km';
+  $('rc-time').textContent = Math.round(data.duration_s / 60);
+  $('rc-turns-n').textContent = data.steps.length;
+  $('rc-points').textContent = data.point_count;
+
+  /* How it was planned, so plans compared one after another say what differs. */
+  const how = [PROFILE_NAMES[data.profile]];
+  if (data.profile !== 'driving') how.push(STYLE_NAMES[data.style]);
+  if (data.avoid.length) how.push('avoiding ' + data.avoid.join(' and '));
+  how.push('planned by ' + (data.router === 'valhalla' ? 'Valhalla' : 'OSRM'));
+  $('rc-how').textContent = how.join(' · ');
+  $('rc-warn').textContent = data.warning || '';
+  $('rc-warn').style.display = data.warning ? 'block' : 'none';
+
+  const list = $('rc-list');
+  list.innerHTML = data.steps.map(s =>
+    `<li>${s.type.replace(/_/g, ' ')}${s.street ? ' &mdash; ' + s.street : ''}</li>`
+  ).join('');
+  [...list.children].forEach((li, i) => {
+    li.onclick = () => map.setView([data.steps[i].lat, data.steps[i].lon], 17);
+  });
+  $('rc-turns').open = false;
+
+  $('route-card').classList.add('on');
+}
+const fmtMin = (s) => Math.round(s / 60) + ' min';
+const fmtMB = (b) => (b / 1e6).toFixed(1) + ' MB';     // as the providers' caps count
+
+/* ------------------------------------------------------------------- plan */
+
+/* A chip flipped while a plan is in flight is not lost: that plan finishes
+   and the route is planned once more with whatever is ticked by then. */
+let planning = false, replan = false;
+
+async function planRoute() {
+  if (planning) { replan = true; return; }
+  if (waypoints.length < 2) { setStatus('Click the map to add a start and a destination.', 'warn'); return; }
+  setStatus('Planning...');
+  $('plan').disabled = true;
+  planning = true;
+
+  try {
+    const res = await fetch('/api/plan', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        waypoints, profile: $('profile').value, name: $('route-name').value,
+        kind: $('kind').value, close_loop: $('close-loop').checked,
+        avoid: selectedAvoid(), style: selectedStyle()
+      })
+    });
+    const data = await res.json();
+    if (!res.ok) { setStatus(data.error || 'Planning failed.', 'err'); return; }
+
+    routeId = data.route_id;
+    $('estimate-out').style.display = 'none';   // counted for the old route
+
+    if (routeLine) routeLayer.removeLayer(routeLine);
+    routeLine = L.polyline(data.geometry, { color: '#2F7BEF', weight: 6, opacity: 0.9 }).addTo(routeLayer);
+    map.fitBounds(routeLine.getBounds(), { padding: [30, 30] });
+
+    stepMarkers.forEach(m => routeLayer.removeLayer(m));
+    stepMarkers = data.steps.map(s => L.circleMarker([s.lat, s.lon], {
+      radius: 5, color: '#fff', weight: 2, fillColor: '#ff9f43', fillOpacity: 1
+    }).addTo(routeLayer).bindTooltip(`${s.type}${s.street ? ' &middot; ' + s.street : ''}`));
+
+    showRouteCard(data);
+
+    setStatus('Route planned. Now estimate or build.');
+    $('build').disabled = false;
+  } catch (e) {
+    setStatus('Planning failed: ' + e, 'err');
+  } finally {
+    $('plan').disabled = false;
+    planning = false;
+    if (replan) { replan = false; planRoute(); }
+  }
+}
+$('plan').onclick = planRoute;
+
+/* --------------------------------------------------------------- estimate */
+
+$('estimate').onclick = async () => {
+  const t = target();
+  if (!t) {
+    setStatus(isArea() ? 'Click two corners of the area first.' : 'Plan a route first.', 'warn');
+    return;
+  }
+  const zooms = selectedZooms();
+  if (!zooms.length) { setStatus('Pick at least one zoom level.', 'warn'); return; }
+
+  setStatus('Counting tiles...');
+  const res = await fetch('/api/estimate', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...t, zooms, corridor_m: +$('corridor').value })
+  });
+  const d = await res.json();
+  if (!res.ok) { setStatus(d.error || 'Estimate failed.', 'err'); return; }
+
+  $('estimate-out').style.display = 'block';
+  $('estimate-out').innerHTML =
+    `<div><span>Tiles</span><b>${d.tile_count}</b></div>` +
+    `<div><span>On the SD card</span><b>${fmtMB(d.bytes_on_card)}</b></div>` +
+    Object.entries(d.per_zoom).map(([z, n]) => `<div><span>z${z}</span><b>${n}</b></div>`).join('');
+
+  if (d.too_many) {
+    setStatus(`${d.tile_count} tiles is over the ${d.limit} limit. ` +
+              (isArea() ? 'Draw a smaller area' : 'Narrow the corridor') +
+              ' or drop a zoom level.', 'err');
+    $('build').disabled = true;
+  } else {
+    setStatus(`Roughly ${Math.ceil(d.tile_count * 0.12 / 60)} min to download at the polite rate.`);
+    $('build').disabled = false;
+  }
+};
+
+/* ------------------------------------------------------------------ build */
+
+$('build').onclick = async () => {
+  const t = target();
+  if (!t) return;
+  const zooms = selectedZooms();
+  if (!zooms.length) { setStatus('Pick at least one zoom level.', 'warn'); return; }
+
+  $('build').disabled = true;
+  setStatus('Starting...');
+
+  const res = await fetch('/api/build', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      ...t, zooms, corridor_m: +$('corridor').value,
+      source: $('source').value, folder: $('folder').value
+    })
+  });
+  const d = await res.json();
+  if (!res.ok) { setStatus(d.error || 'Build failed.', 'err'); $('build').disabled = false; return; }
+
+  const src = new EventSource('/api/progress/' + d.job_id);
+  src.onmessage = (ev) => {
+    if (ev.data === 'error') { src.close(); setStatus('Build failed.', 'err'); $('build').disabled = false; return; }
+    /* Only the server knows when the zip is complete, and a build that stops
+       early - a refused key, an error image - never reaches its total. */
+    if (ev.data === 'finished') { src.close(); finishBuild(d.job_id); return; }
+    const [done, total] = ev.data.split('/').map(Number);
+    setStatus(`Downloading and converting ${done} / ${total} tiles...`);
+  };
+  src.onerror = () => { src.close(); $('build').disabled = false; };
+};
+
+async function finishBuild(jobId) {
+  $('build').disabled = false;
+  const r = await (await fetch('/api/result/' + jobId)).json();
+
+  if (r.error) { setStatus(r.error, 'err'); return; }
+
+  let msg = 'Done.';
+  if (r.missing) msg += ` ${r.missing} tiles were unavailable and skipped.`;
+  if (r.warning) { setStatus(msg + ' ' + r.warning, 'warn'); }
+  else           { setStatus(msg + ' The download should start automatically.'); }
+
+  window.location = '/api/download/' + jobId;
+}
+</script>
+</body>
+</html>

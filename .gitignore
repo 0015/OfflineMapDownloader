@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Tile caches. tiles/ is v1's, tiles_v2/ is v2's per-source cache.
+# Both are rebuildable and can run to hundreds of megabytes.
+tiles/
+tiles_v2/
+
+# macOS
+.DS_Store
+
+# Codex
+.codex/
